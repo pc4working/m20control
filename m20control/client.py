@@ -40,6 +40,10 @@ class RobotSnapshot:
 
 
 class M20Client:
+    _FRAME_PREVIEW_BYTES = 32
+    _MAX_DECODE_LOGS = 5
+    _MAX_NON_STATUS_LOGS = 5
+
     def __init__(self, config: ConnectionConfig, logger: logging.Logger | None = None) -> None:
         self.config = config
         self.logger = logger or logging.getLogger("m20control")
@@ -66,6 +70,8 @@ class M20Client:
         self._odom_yaw = 0.0
         self._yaw_bias: float | None = None
         self._prev_motion_monotonic: float | None = None
+        self._decode_error_count = 0
+        self._non_status_count = 0
 
     def connect(self) -> None:
         self.transport.connect()
@@ -225,7 +231,7 @@ class M20Client:
                 if not data:
                     continue
                 for frame in self.decoder.feed(data):
-                    self._handle_frame(frame)
+                    self._process_frame(frame)
             except socket.timeout:
                 continue
             except OSError:
@@ -237,8 +243,23 @@ class M20Client:
                     self.logger.exception("receive loop stopped by unexpected error")
                 break
 
+    def _process_frame(self, frame: Frame) -> None:
+        if frame.decode_error is not None:
+            self._log_decode_error(frame)
+            return
+        if frame.payload is None:
+            return
+        self._handle_frame(frame)
+
     def _handle_frame(self, frame: Frame) -> None:
-        message = StatusMessage.from_payload(frame.payload)
+        payload = frame.payload
+        if payload is None:
+            return
+        if "PatrolDevice" not in payload:
+            self._log_non_status_payload(payload)
+            return
+
+        message = StatusMessage.from_payload(payload)
         now = time.monotonic()
 
         with self._state_cv:
@@ -249,7 +270,54 @@ class M20Client:
                 self._motion_status = MotionStatus.from_items(message.items)
                 self._last_motion_time = now
                 self._integrate_motion(now, self._motion_status)
+            else:
+                self._log_non_status_message(message)
             self._state_cv.notify_all()
+
+    def _log_decode_error(self, frame: Frame) -> None:
+        self._decode_error_count += 1
+        preview = frame.raw_frame[: self._FRAME_PREVIEW_BYTES]
+        hex_preview = preview.hex(" ")
+        ascii_preview = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in preview)
+
+        if self._decode_error_count <= self._MAX_DECODE_LOGS or self._decode_error_count % 50 == 0:
+            self.logger.warning(
+                "ignored undecodable frame #%d message_id=%d asdu_type=%d frame_len=%d payload_len=%d error=%s hex=%s ascii=%s",
+                self._decode_error_count,
+                frame.message_id,
+                frame.asdu_type,
+                len(frame.raw_frame),
+                len(frame.payload_raw),
+                frame.decode_error,
+                hex_preview,
+                ascii_preview,
+            )
+        elif self._decode_error_count == self._MAX_DECODE_LOGS + 1:
+            self.logger.warning("additional undecodable frames suppressed; latest count=%d", self._decode_error_count)
+
+    def _log_non_status_payload(self, payload: dict) -> None:
+        self._non_status_count += 1
+        if self._non_status_count <= self._MAX_NON_STATUS_LOGS or self._non_status_count % 50 == 0:
+            self.logger.info(
+                "received JSON frame without PatrolDevice root #%d keys=%s",
+                self._non_status_count,
+                sorted(payload.keys()),
+            )
+        elif self._non_status_count == self._MAX_NON_STATUS_LOGS + 1:
+            self.logger.info("additional non-status JSON frames suppressed; latest count=%d", self._non_status_count)
+
+    def _log_non_status_message(self, message: StatusMessage) -> None:
+        self._non_status_count += 1
+        if self._non_status_count <= self._MAX_NON_STATUS_LOGS or self._non_status_count % 50 == 0:
+            self.logger.info(
+                "received non-status JSON frame #%d type=%d command=%d item_keys=%s",
+                self._non_status_count,
+                message.type,
+                message.command,
+                sorted(message.items.keys()),
+            )
+        elif self._non_status_count == self._MAX_NON_STATUS_LOGS + 1:
+            self.logger.info("additional non-status JSON frames suppressed; latest count=%d", self._non_status_count)
 
     def _integrate_motion(self, now: float, motion_status: MotionStatus) -> None:
         if self._yaw_bias is None:

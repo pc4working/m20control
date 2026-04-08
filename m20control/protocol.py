@@ -22,8 +22,10 @@ HEADER_SIZE = HEADER_STRUCT.size
 class Frame:
     message_id: int
     asdu_type: int
+    raw_frame: bytes
     payload_raw: bytes
-    payload: dict[str, Any]
+    payload: dict[str, Any] | None
+    decode_error: str | None = None
 
 
 def encode_json_frame(payload: dict[str, Any], message_id: int) -> bytes:
@@ -67,20 +69,30 @@ class FrameDecoder:
             if len(self._buffer) < total_size:
                 break
 
-            body = bytes(self._buffer[HEADER_SIZE:total_size])
+            raw_frame = bytes(self._buffer[:total_size])
+            body = raw_frame[HEADER_SIZE:total_size]
             del self._buffer[:total_size]
             if not body:
                 continue
 
             asdu_type = body[0]
             payload_raw = body[1:]
-            payload = self._decode_payload(asdu_type, payload_raw)
+            payload: dict[str, Any] | None
+            decode_error: str | None
+            try:
+                payload = self._decode_payload(asdu_type, payload_raw)
+                decode_error = None
+            except ValueError as exc:
+                payload = None
+                decode_error = str(exc)
             frames.append(
                 Frame(
                     message_id=message_id,
                     asdu_type=asdu_type,
+                    raw_frame=raw_frame,
                     payload_raw=payload_raw,
                     payload=payload,
+                    decode_error=decode_error,
                 )
             )
 
@@ -97,5 +109,11 @@ class FrameDecoder:
     def _decode_payload(asdu_type: int, payload_raw: bytes) -> dict[str, Any]:
         if asdu_type != AsduType.JSON:
             raise ValueError(f"unsupported ASDU type: {asdu_type}")
-        text = payload_raw.decode("utf-8")
-        return json.loads(text)
+        try:
+            text = payload_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid utf-8 payload for ASDU type {asdu_type}: {exc}") from exc
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON payload: {exc.msg}") from exc
