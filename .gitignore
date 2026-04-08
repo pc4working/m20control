@@ -5,3 +5,4 @@ __pycache__/
 .codex
 dist/
 build/
+./plan.md
